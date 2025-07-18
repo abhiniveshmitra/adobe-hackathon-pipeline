@@ -1,0 +1,8 @@
+# Core library for running neural networks
+torch
+
+# The library for sentence embeddings
+sentence-transformers
+
+# Used for numerical operations, especially vector similarity calculations
+numpy
