@@ -1,191 +1,149 @@
-import fitz  # PyMuPDF
+import pdfplumber
+import os
 import json
 import re
-from collections import defaultdict
-from pathlib import Path
+from collections import Counter
 
+# --- Configuration ---
+INPUT_DIR = "input_pdfs"
+OUTPUT_DIR = "output_outlines"
+OUTPUT_FILENAME = "structured_output.json"
 
-def get_document_styles(doc):
+def is_likely_heading(line, common_font_size):
     """
-    Analyzes the document to find the primary body font size and a
-    map of larger font sizes to their corresponding heading levels (H1-H4).
+    Heuristic to determine if a line is a heading.
+    - It has a larger font size than the most common text.
+    - It's short and doesn't end with a period.
     """
-    styles = defaultdict(int)
-    for page in doc:
-        blocks = page.get_text("dict").get("blocks", [])
-        for b in blocks:
-            if b.get('type') == 0:
-                for l in b.get('lines', []):
-                    for s in l.get('spans', []):
-                        styles[round(s['size'])] += len(s['text'])
+    if not line['chars']:
+        return False
+    
+    line_font_size = line['chars'][0]['size']
+    line_text = line['text'].strip()
+    
+    # A heading is typically larger than the body text and relatively short.
+    return (line_font_size > common_font_size + 1) and (len(line_text.split()) < 10)
 
-    if not styles:
-        return 0, {}
-
-    body_size = max(styles, key=styles.get) if styles else 0
-    heading_sizes = sorted(
-        [size for size in styles if size > body_size], reverse=True)
-    level_map = {size: f"H{i+1}" for i, size in enumerate(heading_sizes[:4])}
-
-    return body_size, level_map
-
-
-def find_toc_page_num(doc):
+def is_list_item(line_text):
     """
-    Finds the page number containing the Table of Contents.
+    Identifies if a line of text is a list item using regex.
+    Matches common bullet points (•, *, -) or numbered patterns (1., a., etc.).
     """
-    for i, page in enumerate(doc):
-        if "table of contents" in page.get_text("lower"):
-            return i
-    return -1
+    list_pattern = re.compile(r'^\s*([•*-]|\d+\.|\w\.)\s+')
+    return bool(list_pattern.match(line_text))
 
-
-def extract_final_structure(pdf_path):
+def process_pdf(pdf_path):
     """
-    Extracts the document structure using a generic heuristic scoring model.
-    This function adheres to the hackathon rules by avoiding hardcoding.
+    Processes a single PDF to extract its content and a detailed structure.
+    This version uses advanced heuristics for better element identification.
+
+    Args:
+        pdf_path (str): The full path to the PDF file.
+
+    Returns:
+        dict: A dictionary containing the hierarchically structured content of the PDF.
     """
-    doc = fitz.open(pdf_path)
-    if not doc.page_count:
-        return {"title": "", "outline": []}
+    document_structure = {
+        "pdf_path": os.path.basename(pdf_path),
+        "pages": []
+    }
 
-    body_size, level_map = get_document_styles(doc)
-    toc_page = find_toc_page_num(doc)
-    outline = []
-    title = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            page_elements = []
+            
+            # --- Advanced Text and Structure Analysis ---
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=True, use_vertical_lines=True, extra_attrs=['size', 'fontname'])
+            
+            # Find the most common font size to differentiate body text from headings
+            if words:
+                font_sizes = [round(word['size'], 2) for word in words]
+                # Use the most common font size as the baseline for paragraph text
+                most_common_size = Counter(font_sizes).most_common(1)[0][0] if font_sizes else 10
+            else:
+                most_common_size = 10 # Default size if no words found
 
-    # --- Generic Title Extraction Heuristic ---
-    if doc.page_count > 0:
-        page1 = doc[0]
-        max_font_size = body_size
-        for b in page1.get_text("blocks", sort=True):
-            if b[6] == 0 and b[1] < page1.rect.height * 0.35:
-                try:
-                    spans = page1.get_text("dict", clip=b[:4])[
-                        "blocks"][0]["lines"][0]["spans"]
-                    if spans and spans[0]['size'] > max_font_size:
-                        max_font_size = spans[0]['size']
-                        title_text = " ".join(b[4].strip().split())
-                        if len(title_text) > 4 and re.search('[a-zA-Z]', title_text):
-                            title = title_text
-                except (IndexError, KeyError):
+            # Extract text lines with detailed character info
+            lines = page.extract_text_lines(layout=True, strip=False, return_chars=True)
+            
+            for line in lines:
+                line_text = line['text'].strip()
+                if not line_text:
                     continue
+                
+                element_type = "paragraph" # Default type
+                if is_likely_heading(line, most_common_size):
+                    element_type = "heading"
+                elif is_list_item(line_text):
+                    element_type = "list_item"
 
-    # --- Generic Outline Extraction Engine ---
-    heading_regex = re.compile(r"^\s*(\d+(\.\d+)*|Appendix\s+[A-Z])[\s.:]")
+                page_elements.append({
+                    "type": element_type,
+                    "content": line_text,
+                    "bbox": [line['x0'], line['top'], line['x1'], line['bottom']]
+                })
 
-    for page_num, page in enumerate(doc):
-        if page_num == toc_page:
-            continue
+            # --- Extract Tables with Advanced Settings ---
+            # These settings help pdfplumber find tables more reliably
+            table_settings = {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+            }
+            tables = page.extract_tables(table_settings)
+            for table_data in tables:
+                page_elements.append({
+                    "type": "table",
+                    "content": table_data,
+                    "bbox": page.bbox # Bbox for the whole page as table bbox isn't direct
+                })
+                
+            # --- Extract Images ---
+            for img in page.images:
+                page_elements.append({
+                    "type": "image",
+                    "bbox": [img['x0'], page.height - img['y1'], img['x1'], page.height - img['y0']]
+                })
+            
+            # Sort all elements by their vertical position on the page
+            page_elements.sort(key=lambda x: x['bbox'][1])
 
-        table_bboxes = [fitz.Rect(t.bbox) for t in page.find_tables()]
+            document_structure["pages"].append({
+                "page_number": i + 1,
+                "dimensions": [page.width, page.height],
+                "elements": page_elements
+            })
 
-        blocks = page.get_text("blocks", sort=True)
-        for b in blocks:
-            if b[6] != 0:
-                continue
-
-            block_rect = fitz.Rect(b[:4])
-            if any(block_rect.intersects(table_bbox) for table_bbox in table_bboxes):
-                continue
-
-            text = " ".join(b[4].strip().split())
-            if not text or text == title or len(text) > 400:
-                continue
-
-            # --- Heuristic Scoring Model ---
-            score = 0.0
-            level_from_style = None
-            word_count = len(text.split())
-
-            try:
-                spans = page.get_text("dict", clip=b[:4])[
-                    "blocks"][0]["lines"][0]["spans"]
-                if not spans:
-                    continue
-
-                span = spans[0]
-                font_size = round(span['size'])
-                is_bold = span['flags'] & 16
-
-                # 1. Style Features
-                if font_size in level_map:
-                    score += 1.5
-                    level_from_style = level_map[font_size]
-                    if is_bold:
-                        score += 0.5
-
-                # 2. Content Features
-                if word_count < 15:
-                    score += 1
-                else:
-                    score -= 1
-                if not text.endswith(('.', ':')):
-                    score += 1
-
-                # 3. Positional Features
-                block_width = b[2] - b[0]
-                is_centered = abs(
-                    ((page.rect.width - block_width) / 2) - b[0]) < 20
-                if is_centered:
-                    score += 1
-
-                # 4. Structural Features
-                match = heading_regex.match(text)
-                if match:
-                    if word_count < 10:
-                        score += 2.0
-                    else:
-                        score -= 2.0
-
-                # --- Decision & Level Assignment ---
-                if score > 2.5:
-                    final_level = None
-                    if match:
-                        prefix = match.group(1)
-                        if prefix.startswith("Appendix"):
-                            final_level = "H2"
-                        else:
-                            final_level = f"H{prefix.count('.') + 1}"
-                    else:
-                        final_level = level_from_style
-
-                    if final_level:
-                        outline.append({
-                            "level": final_level,
-                            "text": text,
-                            "page": page_num + 1,
-                            "y_pos": b[1]
-                        })
-            except (IndexError, KeyError):
-                continue
-
-    doc.close()
-
-    # --- Final Sorting by Position ---
-    outline.sort(key=lambda x: (x['page'], x['y_pos']))
-    for item in outline:
-        del item['y_pos']
-
-    return {"title": title, "outline": outline}
-
-
-def process_pdfs():
-    """Main execution function to process all PDFs."""
-    input_dir = Path("/app/input")
-    output_dir = Path("/app/output")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for pdf_path in sorted(input_dir.glob("*.pdf")):
-        print(f"Processing {pdf_path.name}...")
-        try:
-            result = extract_final_structure(pdf_path)
-            output_file = output_dir / f"{pdf_path.stem}.json"
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"Failed to process {pdf_path.name}: {e}")
+    return document_structure
 
 
 if __name__ == "__main__":
-    process_pdfs()
+    # Ensure output directory exists
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    all_results = []
+    
+    pdf_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".pdf")]
+    
+    print(f"--- Service 1a: Document Extraction ---")
+    print(f"Found {len(pdf_files)} PDF(s) to process in '{INPUT_DIR}/'.")
+
+    for filename in pdf_files:
+        try:
+            pdf_path = os.path.join(INPUT_DIR, filename)
+            print(f"Processing: {pdf_path}")
+            
+            structured_data = process_pdf(pdf_path)
+            all_results.append(structured_data)
+            
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+
+    # Write all structured data to a single JSON file
+    output_filepath = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
+    with open(output_filepath, "w") as f:
+        json.dump(all_results, f, indent=4)
+        
+    print(f"\n✅ Processing complete. Structured output saved to: {output_filepath}")
