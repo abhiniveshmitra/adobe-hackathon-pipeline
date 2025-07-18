@@ -1,19 +1,15 @@
-version: '3.8'
-
 services:
   # Service 1a: Extracts structured outlines from PDFs
   service1a:
     build:
-      # The path now correctly points inside document_intelligence
-      context: ./document_intelligence/service1a 
+      context: ./service1a
     volumes:
       - pipeline-data:/app/output_outlines
 
   # Service 1b: Ranks content based on a user persona
   service1b:
     build:
-      # This path is also updated
-      context: ./document_intelligence/service1b
+      context: ./service1b
     volumes:
       - pipeline-data:/app/input
     command: >
